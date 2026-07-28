@@ -1,0 +1,19 @@
+# Environment variables and secrets
+backend/.env
+.env
+*.env
+
+# Python build & bytecode
+__pycache__/
+*.py[cod]
+backend/venv/
+storage/*.db
+storage/uploads/*
+storage/outputs/*
+!storage/uploads/.gitkeep
+!storage/outputs/.gitkeep
+
+# Node & Frontend build
+frontend/node_modules/
+frontend/dist/
+.DS_Store
