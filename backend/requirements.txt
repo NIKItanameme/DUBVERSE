@@ -14,4 +14,4 @@ email-validator
 python-dotenv
 httpx
 google-generativeai
-openai-whisper
+openai-whisperffmpeg-python
