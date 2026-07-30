@@ -86,12 +86,17 @@ def process_project_pipeline(project_id: int, db_session_factory):
         project.estimated_time_remaining = 90
         db.commit()
 
-        # Locate input video
+              # Locate input video
+        print("\n========== PROJECT DEBUG ==========")
+        print("Project ID:", project.id)
+        print("Stored URL:", project.original_video_url)
+        print("Video filename:", project.video_filename)
+        print("===================================\n")
+
         input_video_path = None
 
         if project.video_filename:
             input_video_path = UPLOADS_DIR / project.video_filename
-
         # Download YouTube video if needed
         if project.original_video_url and not input_video_path:
             video_out_name = f"project_{project.id}_source.mp4"
