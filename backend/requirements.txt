@@ -10,3 +10,8 @@ yt-dlp
 webvtt-py
 openai
 pyjwt
+email-validator
+python-dotenv
+httpx
+google-generativeai
+openai-whisper
