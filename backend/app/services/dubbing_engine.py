@@ -1,24 +1,18 @@
-import os
-import json
-import time
+
 import shutil
 import requests
 import subprocess
-from pathlib import Path
-from sqlalchemy.orm import Session
+from app.services.audio_service import AudioService
+from app.services.transcription_service import TranscriptionService
+from app.services.translation_service import TranslationService
+from app.services.tts_service import TTSService
+from app.services.video_service import VideoService
 from app.config import (
     UPLOADS_DIR, OUTPUTS_DIR,
     OPENAI_API_KEY, GEMINI_API_KEY,
     ELEVENLABS_API_KEY, INWORLD_API_KEY, INWORLD_VOICE_ID
 )
 from app.models import Project, TranscriptSegment, UserSettings
-
-DEFAULT_SEGMENTS_TEMPLATE = [
-    {"start": 0.0, "end": 4.2, "original": "Welcome to our comprehensive AI video dubbing demonstration.", "translated": "हमारी व्यापक एआई वीडियो डबिंग प्रस्तुति में आपका स्वागत है।", "speaker": "Speaker 1"},
-    {"start": 4.2, "end": 9.5, "original": "This platform allows seamless translation and voice cloning across multiple global languages.", "translated": "यह प्लेटफॉर्म कई वैश्विक भाषाओं में निर्बाध अनुवाद और आवाज क्लोनिंग की अनुमति देता है।", "speaker": "Speaker 1"},
-    {"start": 9.5, "end": 14.8, "original": "With real-time queue tracking and precision audio-video synchronization, dubbing has never been easier.", "translated": "वास्तविक समय की कतार ट्रैकिंग और सटीक ऑडियो-वीडियो सिंक्रोनाइज़ेशन के साथ, डबिंग कभी आसान नहीं रही।", "speaker": "Speaker 1"},
-    {"start": 14.8, "end": 19.2, "original": "Feel free to edit translated transcript segments or export final media in multi-format packages.", "translated": "अनुवादित ट्रांसक्रिप्ट के अंशों को संपादित करने या बहु-स्वरूप पैकेजों में अंतिम मीडिया निर्यात करने के लिए स्वतंत्र महसूस करें।", "speaker": "Speaker 1"}
-]
 
 def run_cmd(cmd):
     try:
@@ -67,45 +61,6 @@ def resolve_tts_provider(user_settings: UserSettings):
                 "or INWORLD_API_KEY (obtain at https://inworld.ai). Please configure at least one in Settings."
             )
         }
-
-def translate_text(text: str, target_lang: str, provider_info: dict) -> str:
-    """Translates text using resolved LLM provider or fallback simulation if keys are missing."""
-    if not provider_info["provider"]:
-        return f"[{target_lang} Translation]: {text}"
-
-    provider = provider_info["provider"]
-    key = provider_info["key"]
-
-    if provider == "openai":
-        try:
-            from openai import OpenAI
-            client = OpenAI(api_key=key)
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": f"Translate English into natural conversational {target_lang}."},
-                    {"role": "user", "content": text}
-                ]
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            print(f"OpenAI Translation error, attempting fallback: {e}")
-
-    elif provider == "gemini":
-        try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={key}"
-            payload = {
-                "contents": [{"parts": [{"text": f"Translate this English text into natural {target_lang}: {text}"}]}]
-            }
-            res = requests.post(url, json=payload, timeout=10)
-            if res.status_code == 200:
-                data = res.json()
-                return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        except Exception as e:
-            print(f"Gemini API error: {e}")
-
-    return f"[{target_lang} Translation]: {text}"
-
 def process_project_pipeline(project_id: int, db_session_factory):
     db = db_session_factory()
     try:
@@ -118,6 +73,11 @@ def process_project_pipeline(project_id: int, db_session_factory):
         # Check Provider Requirements
         llm_provider = resolve_translation_provider(user_settings)
         tts_provider = resolve_tts_provider(user_settings)
+        if not llm_provider["provider"]:
+            raise Exception(llm_provider["error"])
+
+        if not tts_provider["provider"]:
+            raise Exception(tts_provider["error"])
 
         # Stage 1: EXTRACTING AUDIO (10% - 25%)
         project.status = "EXTRACTING"
@@ -126,20 +86,44 @@ def process_project_pipeline(project_id: int, db_session_factory):
         project.estimated_time_remaining = 90
         db.commit()
 
-        time.sleep(2)
-
+        # Locate input video
         input_video_path = None
+
         if project.video_filename:
             input_video_path = UPLOADS_DIR / project.video_filename
 
+        # Download YouTube video if needed
         if project.original_video_url and not input_video_path:
             video_out_name = f"project_{project.id}_source.mp4"
             target_file = UPLOADS_DIR / video_out_name
-            run_cmd(["yt-dlp", "-f", "mp4/best", "-o", str(target_file), project.original_video_url])
+
+            run_cmd([
+                "yt-dlp",
+                "-f",
+                "mp4/best",
+                "-o",
+                str(target_file),
+                project.original_video_url,
+            ])
+
             if target_file.exists():
                 project.video_filename = video_out_name
                 input_video_path = target_file
+                db.commit()
 
+        # Ensure we have a valid video
+        if input_video_path is None or not input_video_path.exists():
+            raise Exception("Input video not found.")
+
+        # Create project output folder
+        project_dir = OUTPUTS_DIR / f"project_{project.id}"
+        project_dir.mkdir(parents=True, exist_ok=True)
+
+        # Extract audio
+        mp3_path, wav_path = AudioService.extract_audio(
+            input_video_path,
+            project_dir,
+        )
         # Stage 2: TRANSCRIBING AUDIO (25% - 50%)
         project.status = "TRANSCRIBING"
         project.progress = 35
@@ -147,89 +131,132 @@ def process_project_pipeline(project_id: int, db_session_factory):
         project.estimated_time_remaining = 65
         db.commit()
 
-        time.sleep(3)
+        # Transcribe audio using Whisper
+        transcriber = TranscriptionService()
 
-        # Stage 3: TRANSLATING TEXT (50% - 70%)
+        segments = transcriber.transcribe(
+            wav_path,
+            project_dir,
+        )
+
+               # Stage 3: TRANSLATING TEXT (50% - 70%)
         project.status = "TRANSLATING"
         project.progress = 60
-        project.current_step = f"Translating segments to {project.target_language} (Provider: {llm_provider['provider'] or 'Fallback Simulation'})..."
+        project.current_step = (
+            f"Translating segments to {project.target_language}..."
+        )
         project.estimated_time_remaining = 40
         db.commit()
 
-        time.sleep(2)
+        # Remove previous transcript
+        db.query(TranscriptSegment).filter(
+            TranscriptSegment.project_id == project.id
+        ).delete()
 
-        # Clear existing segments and insert updated translations
-        db.query(TranscriptSegment).filter(TranscriptSegment.project_id == project.id).delete()
+        # -----------------------------
+        # Translate all transcript segments
+        # -----------------------------
+        translator = TranslationService()
 
-        segments = DEFAULT_SEGMENTS_TEMPLATE
-        if project.target_language.lower() == "spanish":
-            segments = [
-                {"start": 0.0, "end": 4.2, "original": "Welcome to our comprehensive AI video dubbing demonstration.", "translated": "Bienvenido a nuestra demostración integral de doblaje de video con IA.", "speaker": "Speaker 1"},
-                {"start": 4.2, "end": 9.5, "original": "This platform allows seamless translation and voice cloning across multiple global languages.", "translated": "Esta plataforma permite una traducción fluida y clonación de voz en múltiples idiomas.", "speaker": "Speaker 1"},
-                {"start": 9.5, "end": 14.8, "original": "With real-time queue tracking and precision audio-video synchronization, dubbing has never been easier.", "translated": "Con seguimiento de cola en tiempo real y sincronización precisa, doblar nunca ha sido tan fácil.", "speaker": "Speaker 1"},
-                {"start": 14.8, "end": 19.2, "original": "Feel free to edit translated transcript segments or export final media in multi-format packages.", "translated": "Siéntase libre de editar fragmentos o exportar en paquetes multiformato.", "speaker": "Speaker 1"}
-            ]
+        # Replace this with your own TranslationService API
+        segments = translator.translate_segments(
+            segments,
+        )
 
+        # Save translated transcript into database
         for idx, seg in enumerate(segments):
-            translated = translate_text(seg["original"], project.target_language, llm_provider) if llm_provider["provider"] else seg["translated"]
             t_seg = TranscriptSegment(
                 project_id=project.id,
                 segment_index=idx,
                 start_time=seg["start"],
                 end_time=seg["end"],
-                original_text=seg["original"],
-                translated_text=translated,
-                speaker=seg["speaker"]
+                original_text=seg["english"],
+                translated_text=seg["hindi"],
+                speaker=seg.get("speaker", "Speaker 1"),
             )
+
             db.add(t_seg)
 
-        # Stage 4: SYNTHESIZING VOICE (70% - 85%)
+        db.commit()
+
+                # Stage 4: SYNTHESIZING VOICE (70% - 85%)
         project.status = "SYNTHESIZING"
         project.progress = 75
-        project.current_step = f"Synthesizing neural voice clone (TTS Provider: {tts_provider['provider'] or 'Sample Engine'})..."
+        project.current_step = (
+            f"Synthesizing neural voice clone (TTS Provider: {tts_provider['provider'] or 'Inworld'})..."
+        )
         project.estimated_time_remaining = 20
         db.commit()
 
-        time.sleep(3)
+        # Generate speech for every translated segment
+        tts = TTSService()
 
-        # Stage 5: SYNCING AUDIO-VIDEO TIMELINE (85% - 98%)
+        chunks_dir = project_dir / "generated_chunks"
+        chunks_dir.mkdir(parents=True, exist_ok=True)
+
+        generated_files = tts.generate_segments(
+            segments,
+            chunks_dir,
+        )
+
+        db.commit()
+               # Stage 5: SYNCING AUDIO-VIDEO TIMELINE (85% - 98%)
         project.status = "SYNCING"
         project.progress = 90
         project.current_step = "Executing FFmpeg retiming and master audio mix overlay..."
         project.estimated_time_remaining = 5
         db.commit()
 
-        time.sleep(2)
+        # Build final dubbed video
+        final_video = VideoService.build_video(
+            segments=segments,
+            original_video=input_video_path,
+            generated_chunks_dir=chunks_dir,
+            output_dir=project_dir,
+        )
 
         out_video_name = f"dubbed_project_{project.id}.mp4"
         out_audio_name = f"dubbed_project_{project.id}.mp3"
+
         out_video_path = OUTPUTS_DIR / out_video_name
         out_audio_path = OUTPUTS_DIR / out_audio_name
 
-        if input_video_path and input_video_path.exists():
-            shutil.copy(input_video_path, out_video_path)
-        else:
-            with open(out_video_path, "wb") as f:
-                f.write(b"DUBOUTPUT_DUMMY_MP4_HEADER_DATA")
+        # Copy generated video
+        shutil.copy(
+            final_video,
+            out_video_path,
+        )
 
-        with open(out_audio_path, "wb") as f:
-            f.write(b"DUBOUTPUT_DUMMY_MP3_HEADER_DATA")
+        # Copy generated audio
+        final_audio = project_dir / "final_hindi_audio.mp3"
+
+        if final_audio.exists():
+            shutil.copy(
+                final_audio,
+                out_audio_path,
+            )
 
         project.output_video_filename = out_video_name
         project.output_audio_filename = out_audio_name
-        project.duration_seconds = 19.2
+        project.duration_seconds = (
+            segments[-1]["end"] if segments else 0
+        )
         project.segments_count = len(segments)
         project.status = "COMPLETED"
         project.progress = 100
         project.current_step = "Dubbing pipeline successfully completed!"
         project.estimated_time_remaining = 0
+
         db.commit()
 
     except Exception as e:
         print(f"Error processing project {project_id}: {e}")
-        project.status = "FAILED"
-        project.error_message = str(e)
-        project.current_step = f"Processing failed: {str(e)}"
-        db.commit()
+
+        if project:
+            project.status = "FAILED"
+            project.error_message = str(e)
+            project.current_step = f"Processing failed: {str(e)}"
+            db.commit()
+
     finally:
         db.close()

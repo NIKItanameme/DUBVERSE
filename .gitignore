@@ -7,13 +7,19 @@ backend/.env
 __pycache__/
 *.py[cod]
 backend/venv/
-storage/*.db
-storage/uploads/*
-storage/outputs/*
-!storage/uploads/.gitkeep
-!storage/outputs/.gitkeep
+
+# Database
+backend/storage/*.db
+
+# Generated files
+backend/storage/uploads/**
+backend/storage/outputs/**
+!backend/storage/uploads/.gitkeep
+!backend/storage/outputs/.gitkeep
 
 # Node & Frontend build
 frontend/node_modules/
 frontend/dist/
+
+# macOS
 .DS_Store
